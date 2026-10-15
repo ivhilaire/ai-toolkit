@@ -1,10 +1,14 @@
+import math
 import os
 from typing import TYPE_CHECKING, List, Optional
 
+import huggingface_hub
 import torch
 import yaml
 from toolkit import train_tools
-from toolkit.config_modules import GenerateImageConfig, ModelConfig
+from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
+from toolkit.lora_special import LoRASpecialNetwork
+from toolkit.print import print_acc
 from PIL import Image
 from toolkit.models.base_model import BaseModel
 from toolkit.models.v2.vae.qwen_image import QwenImageVAE, QwenImageVAEHolderMixin
@@ -107,6 +111,10 @@ class QwenImageModel(QwenImageVAEHolderMixin, BaseModel):
         )
         flush()
 
+        if self.model_config.inference_lora_path is not None:
+            self.load_inference_lora(transformer)
+            flush()
+
         self.print_and_status_update("Text Encoder")
         tokenizer = Qwen25VLTextEncoder.load_tokenizer(base_model_path, use_fast=False)
         text_encoder = Qwen25VLTextEncoder.load_model(base_model_path, dtype=dtype)
@@ -177,8 +185,154 @@ class QwenImageModel(QwenImageVAEHolderMixin, BaseModel):
         self.pipeline = pipe
         self.print_and_status_update("Model Loaded")
 
+    def load_inference_lora(self, transformer: QwenImageTransformer2DModel):
+        """Attach a sample-only LoRA (`inference_lora_path`), e.g. a Lightning
+        distillation LoRA: inactive while training, switched on for sampling
+        and off again by BaseModel.generate_images. Applied after quantization
+        and the accuracy recovery adapter, so it wraps the same forward the
+        samples use. Accepts diffusers/PEFT (lora_A/lora_B), kohya/comfy
+        (lora_down/lora_up + alpha) keys with or without a "diffusion_model."
+        or "transformer." prefix; alpha is folded into lora_up."""
+        if self.model_config.layer_offloading:
+            raise ValueError("inference_lora_path is not supported with layer_offloading for Qwen Image")
+
+        lora_path = self.model_config.inference_lora_path
+        if not os.path.exists(lora_path):
+            # hub path: "<owner>/<repo>/<file>.safetensors"
+            parts = lora_path.split("/")
+            if len(parts) != 3:
+                raise ValueError(f"inference_lora_path {lora_path} is not a local file or a <owner>/<repo>/<file> hub path")
+            lora_path = huggingface_hub.hf_hub_download(repo_id="/".join(parts[:2]), filename=parts[2])
+            self.model_config.inference_lora_path = lora_path
+        self.print_and_status_update(f"Loading inference LoRA {os.path.basename(lora_path)}")
+
+        suffixes = {
+            "lora_down.weight": "down", "lora_A.weight": "down",
+            "lora_up.weight": "up", "lora_B.weight": "up",
+            "alpha": "alpha",
+        }
+        modules, ignored = {}, []
+        for key, value in load_file(lora_path).items():
+            for suffix, kind in suffixes.items():
+                if key.endswith("." + suffix):
+                    name = key[: -len(suffix) - 1]
+                    for prefix in ("diffusion_model.", "transformer."):
+                        if name.startswith(prefix):
+                            name = name[len(prefix):]
+                            break
+                    modules.setdefault(name, {})[kind] = value
+                    break
+            else:
+                ignored.append(key)
+        if ignored:
+            raise ValueError(
+                f"inference LoRA: {len(ignored)} keys are not LoRA pairs and can't be applied "
+                f"(e.g. {ignored[:5]}); refusing to sample with a partial LoRA"
+            )
+        incomplete = [n for n, w in modules.items() if "down" not in w or "up" not in w]
+        if not modules or incomplete:
+            raise ValueError(f"inference LoRA: no usable lora_down/lora_up pairs (incomplete: {incomplete[:5]})")
+        ranks = {w["down"].shape[0] for w in modules.values()}
+        if len(ranks) != 1:
+            raise ValueError(f"inference LoRA: mixed ranks {sorted(ranks)} are not supported")
+        dim = ranks.pop()
+
+        network_config = NetworkConfig(type="lora", linear=dim, linear_alpha=dim, transformer_only=False)
+        network = LoRASpecialNetwork(
+            text_encoder=None,
+            unet=transformer,
+            lora_dim=dim,
+            multiplier=1.0,
+            alpha=dim,
+            train_unet=True,
+            train_text_encoder=False,
+            network_config=network_config,
+            network_type=network_config.type,
+            transformer_only=False,
+            is_transformer=True,
+            target_lin_modules=self.target_lora_modules,
+            is_assistant_adapter=True,
+            base_model=self,
+        )
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+
+        # match file modules to the network's LoRA modules by the wrapped layer's path in the
+        # transformer; kohya names ("lora_unet_transformer_blocks_0_attn_to_q") by the underscored path
+        path_of = {id(m): n for n, m in transformer.named_modules()}
+        by_path = {}
+        for lora in network.unet_loras:
+            path = path_of.get(id(lora.orig_module_ref()))
+            if path is None:
+                continue
+            by_path[path] = lora
+            by_path["lora_unet_" + path.replace(".", "_")] = lora
+            by_path["lora_transformer_" + path.replace(".", "_")] = lora
+        unmatched = [n for n in modules if n not in by_path]
+        if unmatched:
+            raise ValueError(
+                f"inference LoRA: {len(unmatched)} of {len(modules)} modules not found in the transformer, "
+                f"e.g. {unmatched[:5]}"
+            )
+        # a distillation LoRA covers every block; gaps mean a file for another model or a partial file
+        n_blocks = len(transformer.transformer_blocks)
+        covered = set()
+        for name in modules:
+            path = path_of[id(by_path[name].orig_module_ref())]
+            if path.startswith("transformer_blocks."):
+                covered.add(int(path.split(".")[1]))
+        missing_blocks = sorted(set(range(n_blocks)) - covered)
+        if missing_blocks:
+            raise ValueError(
+                f"inference LoRA: no weights for {len(missing_blocks)} of {n_blocks} transformer blocks "
+                f"(e.g. {missing_blocks[:5]}); wrong or partial file?"
+            )
+        with torch.no_grad():
+            for name, w in modules.items():
+                lora = by_path[name]
+                up = w["up"].float()
+                if "alpha" in w:
+                    up = up * (float(w["alpha"]) / dim)
+                lora.lora_down.weight.copy_(w["down"])
+                lora.lora_up.weight.copy_(up)
+
+        network.force_to("cpu" if self.low_vram else self.device_torch, dtype=self.torch_dtype)
+        network.eval()
+        network.requires_grad_(False)
+        network._update_torch_multiplier()
+        network.is_active = False
+        self.assistant_lora: LoRASpecialNetwork = network
+        print_acc(
+            f"Inference LoRA: {len(modules)} modules loaded (rank {dim}), all {n_blocks} blocks covered, "
+            f"{len(network.unet_loras) - len(modules)} transformer linears without weights"
+        )
+
+    def check_inference_lora_sampling(self, gen_config: GenerateImageConfig):
+        """Fail loudly instead of sampling something other than what the config asks for."""
+        steps, cfg = gen_config.num_inference_steps, gen_config.guidance_scale
+        if self.model_config.inference_lora_path is None:
+            if steps <= 8 and cfg <= 1:
+                raise ValueError(
+                    f"sampling {steps} steps at CFG {cfg} without an inference LoRA: Lightning settings but "
+                    f"model.inference_lora_path is not set (missing or in the wrong config section?)"
+                )
+            return
+        if self.assistant_lora is None or not self.assistant_lora.is_active:
+            raise RuntimeError("inference LoRA is set but not active for this sample round")
+        if cfg != 1 or steps not in (4, 8):
+            raise ValueError(
+                f"inference LoRA (Lightning) needs sample guidance_scale: 1 and sample_steps: 4 or 8, "
+                f"got guidance_scale {cfg}, sample_steps {steps}"
+            )
+
     def get_generation_pipeline(self):
         scheduler = QwenImageModel.get_train_scheduler()
+        if self.model_config.inference_lora_path is not None:
+            # Lightning LoRAs are distilled with a fixed shift (lightx2v: exponential, mu = log(3)),
+            # ComfyUI equivalent: ModelSamplingAuraFlow shift 3
+            shift = float(self.model_config.model_kwargs.get("inference_lora_shift", 3.0))
+            scheduler = CustomFlowMatchEulerDiscreteScheduler(
+                **{**scheduler_config, "base_shift": math.log(shift), "max_shift": math.log(shift), "shift_terminal": None}
+            )
 
         pipeline: QwenImagePipeline = QwenImagePipeline(
             scheduler=scheduler,
@@ -201,6 +355,7 @@ class QwenImageModel(QwenImageVAEHolderMixin, BaseModel):
         generator: torch.Generator,
         extra: dict,
     ):
+        self.check_inference_lora_sampling(gen_config)
         self.model.to(self.device_torch, dtype=self.torch_dtype)
         control_img = None
         if gen_config.ctrl_img is not None:
@@ -267,6 +422,9 @@ class QwenImageModel(QwenImageVAEHolderMixin, BaseModel):
         text_embeddings: PromptEmbeds,
         **kwargs,
     ):
+        if self.assistant_lora is not None and self.assistant_lora.is_active:
+            # the sample-only LoRA must never shape a training step
+            raise RuntimeError("inference LoRA is active during a training step")
         self.model.to(self.device_torch)
         batch_size, num_channels_latents, height, width = latent_model_input.shape
 
