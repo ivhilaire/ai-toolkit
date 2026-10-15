@@ -356,6 +356,10 @@ class QwenImageModel(QwenImageVAEHolderMixin, BaseModel):
         extra: dict,
     ):
         self.check_inference_lora_sampling(gen_config)
+        if self.model_config.inference_lora_path is not None:
+            # torch_multiplier is built on the device the LoRA weights had at the time (cpu with low_vram);
+            # generate_images moved the weights to the gpu, so rebuild it there
+            self.assistant_lora._update_torch_multiplier()
         self.model.to(self.device_torch, dtype=self.torch_dtype)
         control_img = None
         if gen_config.ctrl_img is not None:
