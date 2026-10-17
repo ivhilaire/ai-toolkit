@@ -2816,7 +2816,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
         if self.accelerator.is_main_process:
-            self.save()
+            # homelab: number the final save too. Unnumbered, it was overwritten when a run was extended, and the
+            # resumed loop skips the save at its start step, so the step-N checkpoint was lost.
+            self.save(self.step_num)
         if not self.train_config.disable_sampling:
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)
