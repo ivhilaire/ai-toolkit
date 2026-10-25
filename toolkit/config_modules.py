@@ -571,6 +571,9 @@ class TrainConfig:
         # merge all datasets into one file list so buckets/batches mix across folders;
         # reg datasets pool separately from non-reg ones
         self.pool_datasets: bool = kwargs.get('pool_datasets', False)
+        # "float16" or "float32": run bf16 attention in that dtype on GPUs older than
+        # sm80 (memory-efficient kernel instead of the math path); toolkit/attention_dtype.py
+        self.attention_dtype: Optional[str] = kwargs.get('attention_dtype', None)
         # for swapping which parameters are trained during training
         self.do_paramiter_swapping = kwargs.get('do_paramiter_swapping', False)
         # 0.1 is 10% of the parameters active at a time lower is less vram, higher is more

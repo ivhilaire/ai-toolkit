@@ -110,6 +110,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.network_config = None
         self.train_config = TrainConfig(**self.get_conf('train', {}))
+        if self.train_config.attention_dtype:
+            from toolkit import attention_dtype
+            attention_dtype.install(self.train_config.attention_dtype)
         model_config = self.get_conf('model', {})
         self.modules_being_trained: List[torch.nn.Module] = []
 
